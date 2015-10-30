@@ -9,8 +9,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <sys/stat.h>
 
-#include <embox/block_dev.h>
+#include <util/err.h>
+
+#include <drivers/block_dev.h>
 #include <fs/dvfs.h>
 #include <fs/hlpr_path.h>
 #include <kernel/task/resource/vfs.h>
@@ -67,9 +70,10 @@ int dvfs_create_new(const char *name, struct lookup *lookup, int flags) {
 	struct super_block *sb;
 	struct inode *new_inode;
 	int res;
+
 	assert(lookup);
 	assert(lookup->parent);
-	assert(lookup->parent->flags & O_DIRECTORY);
+	assert(lookup->parent->flags & S_IFDIR);
 
 	sb = lookup->parent->d_sb;
 	lookup->item = dvfs_alloc_dentry();
@@ -80,7 +84,21 @@ int dvfs_create_new(const char *name, struct lookup *lookup, int flags) {
 	dentry_fill(sb, new_inode, lookup->item, lookup->parent);
 	strncpy(lookup->item->name, name, DENTRY_NAME_LEN);
 	inode_fill(sb, new_inode, lookup->item);
-	res = sb->sb_iops->create(new_inode, lookup->parent->d_inode, flags);
+
+	if (!sb->sb_iops->create) {
+		flags |= DVFS_DIR_VIRTUAL;
+	}
+
+	lookup->item->flags |= flags;
+	new_inode->flags |= flags;
+	if (flags & DVFS_DIR_VIRTUAL) {
+		res = 0;
+
+		lookup->item->usage_count++;
+		lookup->parent->flags |= DVFS_CHILD_VIRTUAL;
+	} else {
+		res = sb->sb_iops->create(new_inode, lookup->parent->d_inode, flags);
+	}
 
 	if (res) {
 		dvfs_destroy_dentry(lookup->item);
@@ -101,50 +119,37 @@ extern const struct idesc_ops idesc_file_ops;
  * @retval -ENOENT File is directory or file not found and
  *                 creating is not requested
  */
-int dvfs_open(const char *path, struct file *desc, int mode) {
-	struct lookup lookup;
+struct idesc *dvfs_file_open_idesc(struct lookup *lookup) {
+	struct file *desc;
+	struct idesc *res;
 	struct inode  *i_no;
 
-	dvfs_lookup(path, &lookup);
+	assert(lookup);
 
-	assert(desc);
+	desc = dvfs_alloc_file();
+	if (desc == NULL)
+		return err_ptr(ENOMEM);
 
-	if (!lookup.item) {
-		if (mode & O_CREAT) {
-			char *last_name = strrchr(path, '/');
-			if (dvfs_create_new(last_name ? last_name + 1 : path, &lookup, mode))
-				return -ENOSPC;
-		} else {
-			desc->f_inode = NULL;
-			desc->f_dentry = NULL;
-			return -ENOENT;
-		}
-	}
-
-	i_no = lookup.item->d_inode;
+	i_no = lookup->item->d_inode;
 
 	*desc = (struct file) {
-		.f_dentry = lookup.item,
+		.f_dentry = lookup->item,
 		.f_inode  = i_no,
-		.f_ops    = lookup.item->d_sb->sb_fops,
+		.f_ops    = lookup->item->d_sb->sb_fops,
 		.f_idesc  = {
 			.idesc_amode = FS_MAY_READ | FS_MAY_WRITE,
 			.idesc_ops   = &idesc_file_ops,
 		},
 	};
 
-	if (i_no == NULL || i_no->flags & O_DIRECTORY) {
-		if (lookup.item)
-			dvfs_destroy_dentry(lookup.item);
-		return -ENOENT;
-	}
-
 	assert(desc->f_ops);
-	assert(desc->f_ops->open);
-
-	lookup.item->usage_count++;
-
-	return desc->f_ops->open(i_no, desc);
+	if (desc->f_ops->open) {
+		res = desc->f_ops->open(i_no, &desc->f_idesc);
+		if (err(res)) {
+			return res;
+		}
+	}
+	return &desc->f_idesc;
 }
 
 /**
@@ -214,18 +219,32 @@ int dvfs_close(struct file *desc) {
  */
 int dvfs_write(struct file *desc, char *buf, int count) {
 	int res;
+	int retcode = count;
+	struct inode *inode;
 	if (!desc)
 		return -1;
+
+	inode = desc->f_inode;
+	assert(inode);
+
+	if (inode->length - desc->pos < count) {
+		if (inode->i_ops && inode->i_ops->truncate) {
+			res = inode->i_ops->truncate(desc->f_inode, desc->pos + count);
+			if (res)
+				retcode = -EFBIG;
+		} else
+			retcode = -EFBIG;
+	}
 
 	if (desc->f_ops && desc->f_ops->write)
 		res = desc->f_ops->write(desc, buf, count);
 	else
-		return -ENOSYS;
+		retcode = -ENOSYS;
 
 	if (res > 0)
 		desc->pos += res;
 
-	return res;
+	return retcode;
 }
 
 /**
@@ -267,7 +286,7 @@ extern int set_rootfs_sb(struct super_block *sb);
  * @retval       0 Ok
  * @retval -ENOENT Mount point or device not found
  */
-int dvfs_mount(struct block_dev *dev, char *dest, char *fstype, int flags) {
+int dvfs_mount(struct block_dev *dev, char *dest, const char *fstype, int flags) {
 	struct lookup lookup;
 	struct dumb_fs_driver *drv;
 	struct super_block *sb;
@@ -285,23 +304,31 @@ int dvfs_mount(struct block_dev *dev, char *dest, char *fstype, int flags) {
 		if (lookup.item == NULL)
 			return -ENOENT;
 
-		assert(lookup.item->flags & O_DIRECTORY);
+		assert(lookup.item->flags & S_IFDIR);
 
-		/* Hide dentry of the directory */
-		dlist_del(&lookup.item->children_lnk);
-		dvfs_cache_del(lookup.item);
+		if (!(lookup.item->flags & DVFS_DIR_VIRTUAL)) {
+			/* Hide dentry of the directory */
+			dlist_del(&lookup.item->children_lnk);
+			dvfs_cache_del(lookup.item);
 
-		d = dvfs_alloc_dentry();
-		dentry_fill(sb, NULL, d, lookup.parent);
+			d = dvfs_alloc_dentry();
+
+			dentry_fill(sb, NULL, d, lookup.parent);
+			strcpy(d->name, lookup.item->name);
+		} else {
+			d = lookup.item;
+			/* TODO free related inode */
+		}
+		d->flags |= S_IFDIR | DVFS_MOUNT_POINT;
+		d->d_sb  = sb,
+		d->d_ops = sb ? sb->sb_dops : NULL,
 		d->usage_count++;
 		sb->root = d;
-		d->flags = O_DIRECTORY;
-		strcpy(d->name, lookup.item->name);
 
 		d->d_inode = dvfs_alloc_inode(sb);
 		*d->d_inode = (struct inode) {
-			.flags    = O_DIRECTORY,
-			.i_ops   = sb->sb_iops,
+			.flags    = S_IFDIR,
+			.i_ops    = sb->sb_iops,
 			.i_sb     = sb,
 			.i_dentry = d,
 		};
@@ -313,8 +340,62 @@ int dvfs_mount(struct block_dev *dev, char *dest, char *fstype, int flags) {
 	return 0;
 }
 
-extern void dentry_upd_flags(struct dentry *dentry);
-extern int dentry_full_path(struct dentry *dentry, char *buf);
+int dvfs_umount(struct dentry *d) {
+	return ENOERR;
+}
+
+static struct dentry *iterate_virtual(struct lookup *lookup, struct dir_ctx *ctx) {
+	struct dentry *next_dentry;
+	struct dlist_head *l;
+	int i;
+
+	i = 0;
+	dlist_foreach(l, &lookup->parent->children)
+	{
+		next_dentry = mcast_out(l, struct dentry, children_lnk);
+
+		if (next_dentry->flags & DVFS_DIR_VIRTUAL) {
+			if (i++ == (ctx->flags & ~DVFS_CHILD_VIRTUAL)) {
+				ctx->flags++;
+				lookup->item = next_dentry;
+
+				return next_dentry;
+			}
+		}
+	}
+
+	return NULL;
+}
+
+static struct dentry *iterate_cached(struct super_block *sb,
+		struct lookup *lookup, struct inode *next_inode) {
+	char full_path[DENTRY_NAME_LEN];
+	struct dentry *cached;
+	struct dentry *next_dentry;
+
+	next_dentry = dvfs_alloc_dentry();
+	if (!next_dentry) {
+		dvfs_destroy_inode(next_inode);
+		return NULL;
+	}
+	dentry_fill(sb, next_inode, next_dentry, lookup->parent);
+	inode_fill(sb, next_inode, next_dentry);
+	dentry_upd_flags(next_dentry);
+
+	dentry_full_path(lookup->parent, full_path);
+	dvfs_pathname(next_inode, full_path + strlen(full_path), 0);
+
+	if ((cached = dvfs_cache_get(full_path, lookup))) {
+		dvfs_destroy_dentry(next_dentry);
+		next_dentry = cached;
+	} else {
+		dvfs_pathname(next_inode, next_dentry->name, 0);
+		dvfs_cache_add(next_dentry);
+	}
+
+	return next_dentry;
+}
+
 /**
  * @brief Get next entry in the directory
  * @param lookup  Contains directory dentry (.parent) and
@@ -326,55 +407,50 @@ extern int dentry_full_path(struct dentry *dentry, char *buf);
  */
 int dvfs_iterate(struct lookup *lookup, struct dir_ctx *ctx) {
 	struct super_block *sb;
-	struct inode *parent_inode;
 	struct inode *next_inode;
-	struct dentry *next_dentry = NULL;
 	int res;
-	assert(lookup);
+
 	assert(ctx);
+	assert(lookup);
+	assert(lookup->parent);
+	assert(lookup->parent->d_sb);
+	assert(lookup->parent->d_inode);
 
 	sb = lookup->parent->d_sb;
-	parent_inode = lookup->parent->d_inode;
-	next_inode   = dvfs_alloc_inode(sb);
-	next_dentry  = dvfs_alloc_dentry();
+	assert(sb->sb_iops && sb->sb_iops->iterate);
 
-	lookup->item = next_dentry;
+	if (ctx->flags & DVFS_CHILD_VIRTUAL) {
+		/* we are already in virtual iterate mode */
+		lookup->item = iterate_virtual(lookup, ctx);
 
-	if (!next_inode || !next_dentry) {
-		if (next_dentry)
-			dvfs_destroy_dentry(next_dentry);
-		if (next_inode)
-			dvfs_destroy_inode(next_inode);
+		return 0;
+	}
+
+	next_inode = dvfs_alloc_inode(sb);
+	if (!next_inode) {
 		return -ENOMEM;
 	}
 
-	dentry_fill(sb, next_inode, next_dentry, lookup->parent);
-	assert(sb && sb->sb_iops && sb->sb_iops->iterate);
-	res = sb->sb_iops->iterate(next_inode, parent_inode, ctx);
-	inode_fill(sb, next_inode, next_dentry);
-	dentry_upd_flags(next_dentry);
-
+	res = sb->sb_iops->iterate(next_inode, lookup->parent->d_inode, ctx);
 	if (res) {
-		ctx->pos = 0;
-		dvfs_destroy_dentry(next_dentry);
-		next_dentry = NULL;
-	} else {
-		char full_path[DENTRY_NAME_LEN];
-		struct dentry *cached;
-		dentry_full_path(lookup->parent, full_path);
-		dvfs_pathname(next_inode, full_path + strlen(full_path), 0);
+		/* iterate virtual */
+		dvfs_destroy_inode(next_inode);
 
-		if ((cached = dvfs_cache_get(full_path, lookup))) {
-			dvfs_destroy_dentry(next_dentry);
-			next_dentry = cached;
-		} else {
-		dvfs_pathname(next_inode, next_dentry->name, 0);
-			dvfs_cache_add(next_dentry);
+		lookup->item = NULL;
+		if (lookup->parent->flags & DVFS_CHILD_VIRTUAL) {
+			ctx->flags = DVFS_CHILD_VIRTUAL;
+
+			lookup->item = iterate_virtual(lookup, ctx);
+
+			return 0;
 		}
-		ctx->pos++;
+		return 0;
 	}
-
-	lookup->item = next_dentry;
+	/* caching found inode */
+	lookup->item = iterate_cached(sb, lookup, next_inode);
+	if (NULL == lookup->item) {
+		return -ENOMEM;
+	}
 
 	return 0;
 }

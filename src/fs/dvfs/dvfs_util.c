@@ -6,6 +6,7 @@
 
 #include <fcntl.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <fs/dvfs.h>
 #include <framework/mod/options.h>
@@ -118,7 +119,7 @@ int dvfs_destroy_inode(struct inode *inode) {
 /**
 * @brief Double-linked list of all dentries
 */
-static DLIST_DEFINE(dentry_dlist);
+DLIST_DEFINE(dentry_dlist);
 
 /* @brief Get new dentry from pool
  *
@@ -144,7 +145,6 @@ struct dentry *dvfs_alloc_dentry(void) {
 	}
 
 	memset(dentry, 0, sizeof(struct dentry));
-	dlist_head_init(&dentry->d_lnk);
 	dlist_add_next(&dentry->d_lnk, &dentry_dlist);
 	dlist_init(&dentry->children);
 	return dentry;
@@ -176,8 +176,7 @@ int dvfs_destroy_dentry(struct dentry *dentry) {
  */
 void dentry_upd_flags(struct dentry *dentry) {
 	if (dentry->d_inode) {
-		if (dentry->d_inode->flags & O_DIRECTORY)
-			dentry->flags |= O_DIRECTORY;
+		dentry->flags |= dentry->d_inode->flags & (S_IFMT | S_IRWXA);
 	}
 }
 
@@ -205,17 +204,10 @@ int dvfs_destroy_file(struct file *desc) {
  */
 int inode_fill(struct super_block *sb, struct inode *inode,
                       struct dentry *dentry) {
-	*inode = (struct inode) {
-		.i_dentry  = dentry,
-		.i_sb      = sb,
-		.i_ops     = sb ? sb->sb_iops : NULL,
-		/* Explicitly save some old fields. The rest will be zero. */
-		.start_pos = inode->start_pos,
-		.i_no      = inode->i_no,
-		.i_data    = inode->i_data,
-		.flags     = inode->flags,
-		.length    = inode->length,
-	};
+	inode->i_dentry = dentry;
+	inode->i_sb     = sb;
+	inode->i_ops    = sb ? sb->sb_iops : NULL;
+	/* Other fields are left without changes on purpose */
 
 	return 0;
 }
@@ -247,6 +239,26 @@ int dentry_fill(struct super_block *sb, struct inode *inode,
 	}
 	return 0;
 }
+int dentry_ref_inc(struct dentry *dentry) {
+	dentry->usage_count ++;
+
+	if (dentry->d_sb->root != dentry) {
+		dentry->d_sb->root->usage_count ++;
+	}
+
+	return dentry->usage_count;
+}
+
+int dentry_ref_dec(struct dentry *dentry) {
+	dentry->usage_count --;
+
+	if (dentry->d_sb->root != dentry) {
+		dentry->d_sb->root->usage_count --;
+	}
+
+	return dentry->usage_count;
+
+}
 
 /* Root-related stuff */
 static struct dentry *global_root = NULL;
@@ -255,26 +267,31 @@ extern struct super_block *rootfs_sb(void);
  *        initialize them if they are empty
  */
 int dvfs_update_root(void) {
-	struct super_block *sb = rootfs_sb();
-	struct inode *inode = global_root->d_inode;
-	if (!global_root)
+	struct super_block *sb;
+	struct inode *inode;
+	if (global_root == NULL)
 		global_root = dvfs_alloc_dentry();
 
-	if (!global_root->d_inode)
+	assert(global_root);
+
+	sb = rootfs_sb();
+	inode = global_root->d_inode;
+	if (inode == NULL)
 		inode = dvfs_alloc_inode(sb);
 
 	*global_root = (struct dentry) {
-		.d_sb    = sb,
-		.d_inode = inode,
-		.parent  = global_root,
-		.name    = "/",
-		.flags   = O_DIRECTORY,
+		.d_sb        = sb,
+		.d_inode     = inode,
+		.parent      = global_root,
+		.name        = "/",
+		.flags       = S_IFDIR | DVFS_DIR_VIRTUAL | DVFS_MOUNT_POINT,
 		.usage_count = 1,
+		.d_lnk       = global_root->d_lnk
 	};
 
 	if (global_root->d_inode)
 		*(global_root->d_inode) = (struct inode) {
-			.flags    = O_DIRECTORY,
+			.flags    = S_IFDIR,
 			.i_ops    = sb->sb_iops,
 			.i_sb     = sb,
 			.i_dentry = global_root,

@@ -21,11 +21,8 @@
 #include <fs/fs_driver.h>
 #include <fs/node.h>
 #include <fs/vfs.h>
-#include <framework/mod/options.h>
 
-#define FAT_MAX_SECTOR_SIZE OPTION_GET(NUMBER, fat_max_sector_size)
-uint8_t fat_sector_buff[FAT_MAX_SECTOR_SIZE];
-
+extern uint8_t fat_sector_buff[FAT_MAX_SECTOR_SIZE];
 static int fat_create_dir_entry(struct nas *parent_nas);
 /* VFS-independent functions */
 static struct fat_file_info *fat_fi_alloc(struct nas *nas, void *fs) {
@@ -200,14 +197,12 @@ static int    fatfs_open(struct node *node, struct file_desc *file_desc, int fla
 static int    fatfs_close(struct file_desc *desc);
 static size_t fatfs_read(struct file_desc *desc, void *buf, size_t size);
 static size_t fatfs_write(struct file_desc *desc, void *buf, size_t size);
-static int    fatfs_ioctl(struct file_desc *desc, int request, ...);
 
 static struct kfile_operations fatfs_fop = {
 	.open = fatfs_open,
 	.close = fatfs_close,
 	.read = fatfs_read,
 	.write = fatfs_write,
-	.ioctl = fatfs_ioctl,
 };
 
 /*
@@ -277,10 +272,6 @@ static size_t fatfs_write(struct file_desc *desc, void *buf, size_t size) {
 	return rezult;
 }
 
-static int fatfs_ioctl(struct file_desc *desc, int request, ...) {
-	return 0;
-}
-
 static int fat_mount_files (struct nas *dir_nas);
 extern int fat_unlike_file(struct fat_file_info *fi, uint8_t *path, uint8_t *scratch);
 extern int fat_unlike_directory(struct fat_file_info *fi, uint8_t *path, uint8_t *scratch);
@@ -325,7 +316,7 @@ static int fatfs_format(void *dev) {
 
 	dev_nas = dev_node->nas;
 
-	fat_create_partition(dev_nas->fi->privdata);
+	fat_create_partition(dev_nas->fi->privdata, 12);
 	fat_root_dir_record(dev_nas->fi->privdata);
 
 	return 0;

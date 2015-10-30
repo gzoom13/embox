@@ -10,7 +10,7 @@
 #include <errno.h>
 #include <string.h>
 
-#include <embox/block_dev.h>
+#include <drivers/block_dev.h>
 #include <framework/mod/options.h>
 #include <fs/bcache.h>
 #include <mem/misc/pool.h>
@@ -19,6 +19,7 @@
 #include <util/indexator.h>
 #include <util/math.h>
 
+#define DEFAULT_BDEV_BLOCK_SIZE OPTION_GET(NUMBER, default_block_size)
 #define MAX_DEV_QUANTITY OPTION_GET(NUMBER, dev_quantity)
 
 ARRAY_SPREAD_DEF(const block_dev_module_t, __block_dev_registry);
@@ -27,6 +28,10 @@ POOL_DEF(blockdev_pool, struct block_dev, MAX_DEV_QUANTITY);
 INDEX_DEF(block_dev_idx, 0, MAX_DEV_QUANTITY);
 
 static struct block_dev *devtab[MAX_DEV_QUANTITY];
+
+struct block_dev **get_bdev_tab() {
+	return &devtab[0];
+}
 
 static int block_dev_cache_free(void *dev) {
 	block_dev_t *bdev;
@@ -64,12 +69,13 @@ struct block_dev *block_dev_create_common(char *path, void *driver, void *privda
 		block_dev_free(bdev);
 		return NULL;
 	}
-	devtab[bdev->id] = bdev;
+	devtab[bdev_id] = bdev;
 
 	*bdev = (struct block_dev) {
 		.id = (dev_t)bdev_id,
 		.driver = driver,
 		.privdata = privdata,
+		.block_size = DEFAULT_BDEV_BLOCK_SIZE,
 	};
 
 	strncpy (bdev->name, strrchr(path, '/') ? strrchr(path, '/') + 1 : path, NAME_MAX);

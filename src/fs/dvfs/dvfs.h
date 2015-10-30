@@ -7,7 +7,7 @@
 #ifndef _DVFS_H_
 #define _DVFS_H_
 
-#include <embox/block_dev.h>
+#include <drivers/block_dev.h>
 #include <fs/idesc.h>
 #include <fs/file_system.h>
 #include <util/dlist.h>
@@ -19,9 +19,14 @@
 #define DENTRY_NAME_LEN 36
 #define FS_NAME_LEN     16
 
-#define DVFS_PATH_FULL  0x01
-#define DVFS_PATH_FS    0x02
-#define DVFS_NAME       0x04
+#define DVFS_PATH_FULL     0x001
+#define DVFS_PATH_FS       0x002
+#define DVFS_NAME          0x004
+#define DVFS_DIR_VIRTUAL   0x01000000
+#define DVFS_CHILD_VIRTUAL 0x02000000
+#define DVFS_MOUNT_POINT   0x04000000
+
+#define FILE_TYPE(flags, ftype) ((((flags) & S_IFMT) == (ftype)) ? (ftype) : 0)
 
 struct dentry;
 struct dir_ctx;
@@ -29,6 +34,7 @@ struct dumb_fs_driver;
 struct file;
 struct inode;
 struct super_block;
+struct lookup;
 
 struct super_block {
 	const struct dumb_fs_driver *fs_drv; /* Assume that all FS have single driver */
@@ -50,6 +56,7 @@ struct super_block_operations {
 	int           (*destroy_inode)(struct inode *inode);
 	int           (*write_inode)(struct inode *inode);
 	int           (*umount_begin)(struct super_block *sb);
+	struct idesc *(*open_idesc)(struct lookup *l);
 };
 
 struct inode {
@@ -110,17 +117,23 @@ struct file {
 };
 
 struct file_operations {
-	int    (*open)(struct inode *node, struct file *desc);
+	struct idesc *(*open)(struct inode *node, struct idesc *desc);
 	int    (*close)(struct file *desc);
 	size_t (*read)(struct file *desc, void *buf, size_t size);
 	size_t (*write)(struct file *desc, void *buf, size_t size);
-	int    (*ioctl)(struct file *desc, int request, ...);
+	int    (*ioctl)(struct file *desc, int request, void *data);
 };
 
 struct dumb_fs_driver {
 	const char name[FS_NAME_LEN];
+	int (*format)(void *dev, void *priv);
 	int (*fill_sb)(struct super_block *sb, struct block_dev *dev);
 	int (*mount_end)(struct super_block *sb);
+};
+
+struct auto_mount {
+	char mount_path[DENTRY_NAME_LEN];
+	struct dumb_fs_driver *fs_driver;
 };
 
 struct dvfsmnt {
@@ -136,7 +149,7 @@ struct dvfsmnt {
 };
 
 struct dir_ctx {
-	int   pos;
+	int   flags;
 	void *fs_ctx;
 };
 
@@ -161,12 +174,13 @@ struct lookup {
 extern struct dentry *dvfs_root(void);
 extern int dvfs_lookup(const char *path, struct lookup *lookup);
 extern int dvfs_remove(const char *path);
-extern int dvfs_open(const char *path, struct file *desc, int mode);
+struct idesc *dvfs_file_open_idesc(struct lookup *lookup);
 extern int dvfs_close(struct file *desc);
 extern int dvfs_write(struct file *desc, char *buf, int count);
 extern int dvfs_read(struct file *desc, char *buf, int count);
 extern int dvfs_iterate(struct lookup *lookup, struct dir_ctx *ctx);
 extern int dvfs_pathname(struct inode *inode, char *buf, int flags);
+extern int dvfs_create_new(const char *name, struct lookup *lookup, int flags);
 
 /* dcache-related stuff */
 extern struct dentry *dvfs_cache_lookup(const char *path, struct dentry *base);
@@ -178,5 +192,12 @@ extern struct super_block *dvfs_alloc_sb(struct dumb_fs_driver *drv, struct bloc
 
 extern struct dumb_fs_driver *dumb_fs_driver_find(const char *name);
 
-extern int dvfs_mount(struct block_dev *dev, char *dest, char *fstype, int flags);
+extern int dvfs_mount(struct block_dev *dev, char *dest, const char *fstype, int flags);
+extern int dvfs_umount(struct dentry *d);
+
+extern void dentry_upd_flags(struct dentry *dentry);
+extern int dentry_full_path(struct dentry *dentry, char *buf);
+extern int dentry_ref_inc(struct dentry *dentry);
+extern int dentry_ref_dec(struct dentry *dentry);
+
 #endif
